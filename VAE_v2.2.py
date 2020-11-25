@@ -1,7 +1,10 @@
 """
-First simple implementation of ECG VAE on PTB XL
+Adapted implementation of ECG VAE on PTB XL
 
-Architecture is purely based on (transposed) convolutions, batchnorm and nonlinearities
+- Main difference compared to v2.0 is that each convolution is repeated 3 times
+
+- Size of network is comparable to v2.0 (slightly larger), converges even faster then v2.1, outcome still comparable to v2.0
+- Plotting function now has fixed y-limits
 
 """
 from __future__ import absolute_import
@@ -26,25 +29,30 @@ import PIL.Image
 from torchvision.transforms import ToTensor
 import torchvision
 
+import matplotlib.pyplot as plt
+
 from pytorch_lightning.loggers import TensorBoardLogger
-logger = TensorBoardLogger('lightning_logs', name='TBXL_VAE_v1')
+logger = TensorBoardLogger('lightning_logs', name='TBXL_VAE_v2.2')
 
 
 class VAEEncoder(nn.Module):
     """
         VAE Encoder module
     """
-    def __init__(self, dims: list, in_channels:int = 12):
+    def __init__(self, dims, sample_dims, in_channels: int = 12, in_samples: int = 1000):
         super(VAEEncoder, self).__init__()
         self.layers = []
 
-        for dim in dims:
+        for channel_dim, sample_dim in zip(dims, sample_dims):
             self.layers.append(nn.Sequential(
-                nn.Conv1d(in_channels, dim, 3, stride=1, padding=1),
-                nn.BatchNorm1d(dim),
+                nn.Conv1d(in_channels, channel_dim, 3, stride=1, padding=1),
+                nn.BatchNorm1d(channel_dim),
                 nn.ReLU(),
+                nn.Linear(in_samples, sample_dim),
+                nn.ReLU()
             ))
-            in_channels = dim
+            in_channels = channel_dim
+            in_samples = sample_dim
 
         self.layers.append(nn.Flatten())
 
@@ -53,6 +61,7 @@ class VAEEncoder(nn.Module):
     def forward(self, x):
         for l in self.layers:
             # print(x.shape)
+            # print(l)
             x = l.forward(x)
 
         # print(x.shape)
@@ -64,17 +73,21 @@ class VAEDecoder(nn.Module):
     """
         VAE Decoder module
     """
-    def __init__(self, inversed_dims: list, latent_dim, out_channels: int = 12):
+    def __init__(self, inversed_dims, inversed_sample_dims, out_channels: int = 12):
         super(VAEDecoder, self).__init__()
         self.layers = []
         in_channels = inversed_dims[0]
-        for dim in inversed_dims[1:]:
+        in_samples = inversed_sample_dims[0]
+        for channel_dim, sample_dim in zip(inversed_dims[1:], inversed_sample_dims[1:]):
             self.layers.append(nn.Sequential(
-                nn.ConvTranspose1d(in_channels, dim, 3, padding=1, stride=1),
-                nn.BatchNorm1d(dim),
+                nn.ConvTranspose1d(in_channels, channel_dim, 3, padding=1, stride=1),
+                nn.BatchNorm1d(channel_dim),
                 nn.ReLU(),
+                nn.Linear(in_samples, sample_dim),
+                nn.ReLU()
             ))
-            in_channels = dim
+            in_channels = channel_dim
+            in_samples = sample_dim
 
         self.layers.append(nn.ConvTranspose1d(inversed_dims[-1], out_channels, 3, padding=1, stride=1))
 
@@ -83,6 +96,7 @@ class VAEDecoder(nn.Module):
     def forward(self, x):
         for l in self.layers:
             # print(x.shape)
+            # print(l)
             x = l.forward(x)
 
         # print(x.shape)
@@ -121,30 +135,31 @@ class VAE(pl.LightningModule):
         self.lr = lr
         self.sample_dim = sample_dim
 
-        self.hidden_dims = [32, 64, 128, 256]
+        self.hidden_dims = [32, 32, 32, 64, 64, 64, 128, 128, 128, 256, 256, 256]
+        self.hidden_sample_dims = [1000, 1000, 1000, 500, 500, 500, 250, 250, 250, 125, 125, 125]
 
-        self.enc_output_data_dim = sample_dim
+        self.enc_output_data_dim = self.hidden_sample_dims[-1]
 
         self.fc_mu = nn.Linear(self.hidden_dims[-1]*self.enc_output_data_dim, self.latent_dim)
         self.fc_var = nn.Linear(self.hidden_dims[-1]*self.enc_output_data_dim, self.latent_dim)
 
-        self.encoder = VAEEncoder(self.hidden_dims)
+        self.encoder = VAEEncoder(self.hidden_dims, self.hidden_sample_dims)
 
         self.decoder_input = nn.Linear(latent_dim, self.hidden_dims[-1] * self.enc_output_data_dim)
-        self.decoder = VAEDecoder(list(reversed(self.hidden_dims)), self.latent_dim)
+        self.decoder = VAEDecoder(list(reversed(self.hidden_dims)), list(reversed(self.hidden_sample_dims)))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x):
         x = self.encoder(x)
         mu = self.fc_mu(x)
         log_var = self.fc_var(x)
         p, q, z = self.sample(mu, log_var)
 
         z = self.decoder_input(z)
-        z = z.reshape(-1, self.hidden_dims[-1], self.sample_dim)
+        z = z.reshape(-1, self.hidden_dims[-1], self.enc_output_data_dim)
 
         return self.decoder(z)
 
-    def _run_step(self, x: torch.Tensor):
+    def _run_step(self, x):
         x = self.encoder(x)
         mu = self.fc_mu(x)
         log_var = self.fc_var(x)
@@ -155,7 +170,7 @@ class VAE(pl.LightningModule):
 
         return z, self.decoder(d_z), p, q
 
-    def sample(self, mu: torch.Tensor, log_var: torch.Tensor):
+    def sample(self, mu, log_var):
         std = torch.exp(log_var / 2)
         p = torch.distributions.Normal(torch.zeros_like(mu), torch.ones_like(std))
         q = torch.distributions.Normal(mu, std)
@@ -210,10 +225,10 @@ class VAE(pl.LightningModule):
         parser.add_argument("--lr", type=float, default=1e-6)
 
         parser.add_argument("--kl_coeff", type=float, default=0.1)
-        parser.add_argument("--latent_dim", type=int, default=256)
+        parser.add_argument("--latent_dim", type=int, default=512)
 
         parser.add_argument("--batch_size", type=int, default=256)
-        parser.add_argument("--num_workers", type=int, default=8)
+        parser.add_argument("--num_workers", type=int, default=4)
         parser.add_argument("--data_dir", type=str, default=".")
 
         return parser
@@ -230,21 +245,27 @@ def figureToTensor(figure):
 
 
 class ReconstructionPlottingCallback(Callback):
-    def on_validation_end(self, trainer: pl.Trainer, model: VAE):
+    def on_validation_end(self, trainer:pl.Trainer, model:VAE):
         test_sample = np.load("./PTB_XL/records100/21000/21477_lr.npy", allow_pickle=True)
 
-        original = wfdb.plot.plot_items(test_sample, return_fig=True)
+        original, all_org_axis = wfdb.plot.plot_items(test_sample, return_fig_axes=True)
+
+        for org_axis in all_org_axis:
+            plt.setp(org_axis, ylim=(-1, 1))
 
         test_sample = torch.from_numpy(test_sample.swapaxes(0, 1)).float().unsqueeze(dim=0).to('cuda:0')
         reconstruction_raw = model.forward(test_sample)
 
-        reconstruction = wfdb.plot.plot_items(reconstruction_raw.squeeze(dim=0).transpose(0, 1).cpu().detach().numpy(),
-                                              return_fig=True)
+        reconstruction, all_recon_axis = wfdb.plot.plot_items(reconstruction_raw.squeeze(dim=0).transpose(0, 1).cpu().detach().numpy(),
+                                              return_fig_axes=True)
+
+        for recon_axis in all_recon_axis:
+            plt.setp(recon_axis, ylim=(-1, 1))
 
         grid = torchvision.utils.make_grid([figureToTensor(original), figureToTensor(reconstruction)])
 
         tensorboard = trainer.logger.experiment
-        tensorboard.add_image("Orginal/Reconstruction", grid)
+        tensorboard.add_image("Orginal/Reconstruction", grid, global_step=trainer.global_step)
 
 
 def cli_main(args=None):
@@ -267,7 +288,6 @@ def cli_main(args=None):
     trainer = pl.Trainer.from_argparse_args(
         args,
         callbacks=[ReconstructionPlottingCallback()],
-        resume_from_checkpoint='./lightning_logs/TBXL_VAE_v1/version_7/checkpoints/epoch=58.ckpt',
         logger=logger)
     trainer.fit(model, dm)
     return dm, model, trainer
