@@ -1,14 +1,7 @@
 """
+Adapted implementation of ECG VAE using an additional FFT_loss on PTB XL
 
--- VERSION 3 --
-
-Adapted implementation of ECG VAE on PTB XL
-
--   V3 uses residual connections between the repeated convolution layers and does only have 1 linear layer after each
-    set of convolutions. This makes the network smaller then v2.1/v2.2
-
--   Convergence is slightly slower then v2.1 and v2.2 - still ends up around the same value but seems slightly more
-    "noisy" in its reproductions
+- Performance did  not increase compared to v2.2
 
 """
 from __future__ import absolute_import
@@ -36,88 +29,36 @@ import torchvision
 import matplotlib.pyplot as plt
 
 from pytorch_lightning.loggers import TensorBoardLogger
-logger = TensorBoardLogger('lightning_logs', name='TBXL_VAE_v3')
+logger = TensorBoardLogger('lightning_logs', name='TBXL_VAE_v2.2_FFT_loss')
 
 
-class ConvBlockForward(nn.Module):
-    """ Forward block performing 1d convolution, batchnorm and relu"""
 
-    def __init__(self, in_dim: int, out_dim: int):
-        super(ConvBlockForward, self).__init__()
+def FFT_loss(input, target):
+    test = 0
+    for sig_idx in range(input.shape[1]):
+        FFT_input_i = torch.rfft(input[:, sig_idx], 1)
+        FFT_target_i = torch.rfft(target[:, sig_idx], 1)
+        test += torch.functional.F.mse_loss(FFT_input_i, FFT_target_i, reduction="mean")
 
-        self.f = nn.Sequential(
-            nn.Conv1d(in_dim, out_dim, 3, stride=1, padding=1),
-            nn.BatchNorm1d(out_dim),
-            nn.ReLU(),
-        )
-
-    def forward(self, x):
-        return self.f.forward(x)
-
-
-class ConvBlockBackWard(nn.Module):
-    """ Backward block performing transposed 1d convolution, batchnorm and relu"""
-
-    def __init__(self, in_dim: int, out_dim: int):
-        super(ConvBlockBackWard, self).__init__()
-
-        self.f = nn.Sequential(
-            nn.ConvTranspose1d(in_dim, out_dim, 3, stride=1, padding=1),
-            nn.BatchNorm1d(out_dim),
-            nn.ReLU(),
-        )
-
-    def forward(self, x):
-        return self.f.forward(x)
-
-
-class ResidualConvBlockForward(nn.Module):
-    def __init__(self, in_dim):
-        super(ResidualConvBlockForward, self).__init__()
-        self.f = nn.Sequential(
-            nn.Conv1d(in_dim, in_dim, 3, stride=1, padding=1),
-            nn.BatchNorm1d(in_dim),
-            nn.ReLU(),
-        )
-
-    def forward(self, x):
-        return x + self.f.forward(x)
-
-
-class ResidualConvBlockBackward(nn.Module):
-    def __init__(self, in_dim):
-        super(ResidualConvBlockBackward, self).__init__()
-        self.f = nn.Sequential(
-            nn.ConvTranspose1d(in_dim, in_dim, 3, stride=1, padding=1),
-            nn.BatchNorm1d(in_dim),
-            nn.ReLU(),
-        )
-
-    def forward(self, x):
-        return x + self.f.forward(x)
+    return test/input.shape[1]
 
 
 class VAEEncoder(nn.Module):
     """
         VAE Encoder module
     """
-    def __init__(self, dims, sample_dims, in_channels: int = 12, in_samples: int = 1000, repeat_convs: int = 4):
+    def __init__(self, dims, sample_dims, in_channels: int = 12, in_samples: int = 1000):
         super(VAEEncoder, self).__init__()
         self.layers = []
 
         for channel_dim, sample_dim in zip(dims, sample_dims):
-            self.layers.append(
-                nn.Sequential(
-                    *[ResidualConvBlockForward(in_channels) for i in range(repeat_convs - 1)]
-                )
-            )
-            self.layers.append(
-                nn.Sequential(
-                    ConvBlockForward(in_channels, channel_dim),
-                    nn.Linear(in_samples, sample_dim),
-                    nn.ReLU()
-                )
-            )
+            self.layers.append(nn.Sequential(
+                nn.Conv1d(in_channels, channel_dim, 3, stride=1, padding=1),
+                nn.BatchNorm1d(channel_dim),
+                nn.ReLU(),
+                nn.Linear(in_samples, sample_dim),
+                nn.ReLU()
+            ))
             in_channels = channel_dim
             in_samples = sample_dim
 
@@ -140,25 +81,19 @@ class VAEDecoder(nn.Module):
     """
         VAE Decoder module
     """
-    def __init__(self, inversed_dims, inversed_sample_dims, out_channels: int = 12, repeat_convs: int = 4):
+    def __init__(self, inversed_dims, inversed_sample_dims, out_channels: int = 12):
         super(VAEDecoder, self).__init__()
         self.layers = []
         in_channels = inversed_dims[0]
         in_samples = inversed_sample_dims[0]
         for channel_dim, sample_dim in zip(inversed_dims[1:], inversed_sample_dims[1:]):
-            self.layers.append(
-                nn.Sequential(
-                    *[ResidualConvBlockBackward(in_channels) for i in range(repeat_convs - 1)]
-                )
-            )
-            self.layers.append(
-                nn.Sequential(
-                    ConvBlockBackWard(in_channels, channel_dim),
-                    nn.Linear(in_samples, sample_dim),
-                    nn.ReLU()
-                )
-            )
-
+            self.layers.append(nn.Sequential(
+                nn.ConvTranspose1d(in_channels, channel_dim, 3, padding=1, stride=1),
+                nn.BatchNorm1d(channel_dim),
+                nn.ReLU(),
+                nn.Linear(in_samples, sample_dim),
+                nn.ReLU()
+            ))
             in_channels = channel_dim
             in_samples = sample_dim
 
@@ -189,7 +124,6 @@ class VAE(pl.LightningModule):
         latent_dim: int = 256,
         lr: float = 1e-4,
         sample_dim:int = 1000,
-        repeat_convs = 8,
         **kwargs
     ):
         """
@@ -209,21 +143,18 @@ class VAE(pl.LightningModule):
         self.lr = lr
         self.sample_dim = sample_dim
 
-        self.hidden_dims = [32, 64, 128, 256]
-        self.hidden_sample_dims = [1000, 500, 250, 125]
-
-        self.repeat_convs = repeat_convs
+        self.hidden_dims = [32, 32, 32, 64, 64, 64, 128, 128, 128, 256, 256, 256]
+        self.hidden_sample_dims = [1000, 1000, 1000, 500, 500, 500, 250, 250, 250, 125, 125, 125]
 
         self.enc_output_data_dim = self.hidden_sample_dims[-1]
 
         self.fc_mu = nn.Linear(self.hidden_dims[-1]*self.enc_output_data_dim, self.latent_dim)
         self.fc_var = nn.Linear(self.hidden_dims[-1]*self.enc_output_data_dim, self.latent_dim)
 
-        self.encoder = VAEEncoder(self.hidden_dims, self.hidden_sample_dims, repeat_convs=self.repeat_convs)
+        self.encoder = VAEEncoder(self.hidden_dims, self.hidden_sample_dims)
 
         self.decoder_input = nn.Linear(latent_dim, self.hidden_dims[-1] * self.enc_output_data_dim)
-
-        self.decoder = VAEDecoder(list(reversed(self.hidden_dims)), list(reversed(self.hidden_sample_dims)), repeat_convs=self.repeat_convs)
+        self.decoder = VAEDecoder(list(reversed(self.hidden_dims)), list(reversed(self.hidden_sample_dims)))
 
     def forward(self, x):
         x = self.encoder(x)
@@ -259,6 +190,8 @@ class VAE(pl.LightningModule):
         x, y = batch
         z, x_hat, p, q = self._run_step(x)
 
+        fft_loss = FFT_loss(x_hat, x)
+
         recon_loss = torch.functional.F.mse_loss(x_hat, x, reduction='mean')
 
         log_qz = q.log_prob(z)
@@ -270,11 +203,13 @@ class VAE(pl.LightningModule):
 
         self.log("Recon loss", recon_loss, prog_bar=True)
         self.log("KL loss", kl, prog_bar=True)
+        self.log("FFT loss", fft_loss, prog_bar=True)
 
-        loss = kl + recon_loss
+        loss = kl + fft_loss
 
         logs = {
             "recon_loss": recon_loss,
+            "FFT loss": fft_loss,
             "kl": kl,
             "loss": loss,
         }
@@ -302,10 +237,10 @@ class VAE(pl.LightningModule):
         parser.add_argument("--lr", type=float, default=1e-6)
 
         parser.add_argument("--kl_coeff", type=float, default=0.1)
-        parser.add_argument("--latent_dim", type=int, default=256)
+        parser.add_argument("--latent_dim", type=int, default=512)
 
         parser.add_argument("--batch_size", type=int, default=256)
-        parser.add_argument("--num_workers", type=int, default=8)
+        parser.add_argument("--num_workers", type=int, default=4)
         parser.add_argument("--data_dir", type=str, default=".")
 
         return parser
@@ -322,7 +257,7 @@ def figureToTensor(figure):
 
 
 class ReconstructionPlottingCallback(Callback):
-    def on_validation_end(self, trainer: pl.Trainer, model: VAE):
+    def on_validation_end(self, trainer:pl.Trainer, model:VAE):
         test_sample = np.load("./PTB_XL/records100/21000/21477_lr.npy", allow_pickle=True)
 
         original, all_org_axis = wfdb.plot.plot_items(test_sample, return_fig_axes=True)
@@ -333,9 +268,8 @@ class ReconstructionPlottingCallback(Callback):
         test_sample = torch.from_numpy(test_sample.swapaxes(0, 1)).float().unsqueeze(dim=0).to('cuda:0')
         reconstruction_raw = model.forward(test_sample)
 
-        reconstruction, all_recon_axis = wfdb.plot.plot_items(
-            reconstruction_raw.squeeze(dim=0).transpose(0, 1).cpu().detach().numpy(),
-            return_fig_axes=True)
+        reconstruction, all_recon_axis = wfdb.plot.plot_items(reconstruction_raw.squeeze(dim=0).transpose(0, 1).cpu().detach().numpy(),
+                                              return_fig_axes=True)
 
         for recon_axis in all_recon_axis:
             plt.setp(recon_axis, ylim=(-1, 1))

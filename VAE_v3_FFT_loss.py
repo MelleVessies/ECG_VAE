@@ -1,14 +1,7 @@
 """
+Adapted implementation of v3 ECG VAE using an additional FFT_loss on PTB XL
 
--- VERSION 3 --
-
-Adapted implementation of ECG VAE on PTB XL
-
--   V3 uses residual connections between the repeated convolution layers and does only have 1 linear layer after each
-    set of convolutions. This makes the network smaller then v2.1/v2.2
-
--   Convergence is slightly slower then v2.1 and v2.2 - still ends up around the same value but seems slightly more
-    "noisy" in its reproductions
+- Performance did  not increase compared to v3
 
 """
 from __future__ import absolute_import
@@ -36,7 +29,16 @@ import torchvision
 import matplotlib.pyplot as plt
 
 from pytorch_lightning.loggers import TensorBoardLogger
-logger = TensorBoardLogger('lightning_logs', name='TBXL_VAE_v3')
+logger = TensorBoardLogger('lightning_logs', name='TBXL_VAE_v3_FFT_loss')
+
+def FFT_loss(input, target):
+    test = 0
+    for sig_idx in range(input.shape[1]):
+        FFT_input_i = torch.rfft(input[:, sig_idx], 1)
+        FFT_target_i = torch.rfft(target[:, sig_idx], 1)
+        test += torch.functional.F.mse_loss(FFT_input_i, FFT_target_i, reduction="mean")
+
+    return test/input.shape[1]
 
 
 class ConvBlockForward(nn.Module):
@@ -259,6 +261,7 @@ class VAE(pl.LightningModule):
         x, y = batch
         z, x_hat, p, q = self._run_step(x)
 
+        fft_loss = FFT_loss(x_hat, x)
         recon_loss = torch.functional.F.mse_loss(x_hat, x, reduction='mean')
 
         log_qz = q.log_prob(z)
@@ -270,12 +273,14 @@ class VAE(pl.LightningModule):
 
         self.log("Recon loss", recon_loss, prog_bar=True)
         self.log("KL loss", kl, prog_bar=True)
+        self.log("FFT loss", fft_loss, prog_bar=True)
 
-        loss = kl + recon_loss
+        loss = kl + recon_loss + fft_loss
 
         logs = {
             "recon_loss": recon_loss,
             "kl": kl,
+            "FFT loss": fft_loss,
             "loss": loss,
         }
         return loss, logs
